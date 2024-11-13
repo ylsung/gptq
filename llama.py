@@ -31,6 +31,10 @@ def llama_sequential(model, dataloader, dev):
     model.model.embed_tokens = model.model.embed_tokens.to(dev)
     model.model.norm = model.model.norm.to(dev)
     layers[0] = layers[0].to(dev)
+    
+    if getattr(model.model, 'rotary_emb', None):
+        # for llama3 and qwen models when transformers >=4.45.0
+        model.model.rotary_emb = model.model.rotary_emb.to(dev)
 
     dtype = next(iter(model.parameters())).dtype
     inps = torch.zeros(
@@ -55,6 +59,10 @@ def llama_sequential(model, dataloader, dev):
         except ValueError:
             pass
     layers[0] = layers[0].module
+    
+    if getattr(model.model, 'rotary_emb', None):
+        # for llama3 and qwen models when transformers >=4.45.0
+        model.model.rotary_emb = model.model.rotary_emb.cpu()
 
     layers[0] = layers[0].cpu()
     model.model.embed_tokens = model.model.embed_tokens.cpu()
@@ -81,38 +89,59 @@ def llama_sequential(model, dataloader, dev):
             ]
         else:
             sequential = [list(full.keys())]
-       
+
         for names in sequential:
             subset = {n: full[n] for n in names}
-
             gptq = {}
-            for name in subset:
-                gptq[name] = GPTQ(subset[name])
-                gptq[name].quantizer = Quantizer()
-                gptq[name].quantizer.configure(
-                    args.wbits, perchannel=True, sym=args.sym, mse=False
-                )
 
-            def add_batch(name):
-                def tmp(_, inp, out):
-                    gptq[name].add_batch(inp[0].data, out.data)
-                return tmp
-            handles = []
-            for name in subset:
-                handles.append(subset[name].register_forward_hook(add_batch(name)))
-            for j in range(args.nsamples):
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
-            for h in handles:
-                h.remove()
+            if args.nearest:
+                for name in subset:
+                    print(i, name)
+                    print('RTN Quantizing ...')
+                    quantizer = Quantizer()
+                    quantizer.configure(
+                        args.wbits, perchannel=True, sym=False, mse=False
+                    )
+                    W = subset[name].weight.data
+                    quantizer.find_params(W, weight=True)
+                    subset[name].weight.data = quantize(
+                        W, quantizer.scale, quantizer.zero, quantizer.maxq
+                    ).to(next(iter(layer.parameters())).dtype)
+            else:
+                for name in subset:
+                    # Different bitwidths for different modules
+                    if args.wbits_yaml is not None:
+                        import yaml
+                        layer_weight_bits = yaml.safe_load(open(args.wbits_yaml, "r"))[name]
+                    else:
+                        layer_weight_bits = args.wbits
+                    
+                    gptq[name] = GPTQ(subset[name])
+                    gptq[name].quantizer = Quantizer()
+                    gptq[name].quantizer.configure(
+                        layer_weight_bits, perchannel=True, sym=args.sym, mse=True
+                    )
 
-            for name in subset:
-                print(i, name)
-                print('Quantizing ...')
-                gptq[name].fasterquant(
-                    percdamp=args.percdamp, groupsize=args.groupsize, actorder=args.act_order, static_groups=args.static_groups
-                )
-                quantizers['model.layers.%d.%s' % (i, name)] = gptq[name].quantizer
-                gptq[name].free()
+                def add_batch(name):
+                    def tmp(_, inp, out):
+                        gptq[name].add_batch(inp[0].data, out.data)
+                    return tmp
+                handles = []
+                for name in subset:
+                    handles.append(subset[name].register_forward_hook(add_batch(name)))
+                for j in range(args.nsamples):
+                    outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                for h in handles:
+                    h.remove()
+
+                for name in subset:
+                    print(i, name)
+                    print('Quantizing ...')
+                    gptq[name].fasterquant(
+                        percdamp=args.percdamp, groupsize=args.groupsize, actorder=args.act_order, static_groups=args.static_groups
+                    )
+                    quantizers['model.layers.%d.%s' % (i, name)] = gptq[name].quantizer
+                    gptq[name].free()
 
         for j in range(args.nsamples):
             outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
@@ -141,6 +170,10 @@ def llama_eval(model, testenc, dev):
 
     model.model.embed_tokens = model.model.embed_tokens.to(dev)
     layers[0] = layers[0].to(dev)
+    
+    # for transformers >= 4.45.0
+    if getattr(model.model, 'rotary_emb', None):
+        model.model.rotary_emb = model.model.rotary_emb.to(dev)
 
     dtype = next(iter(model.parameters())).dtype
     inps = torch.zeros(
@@ -166,6 +199,10 @@ def llama_eval(model, testenc, dev):
         except ValueError:
             pass
     layers[0] = layers[0].module
+    
+    # for transformers >= 4.45.0
+    if getattr(model.model, 'rotary_emb', None):
+        model.model.rotary_emb = model.model.rotary_emb.cpu()
 
     layers[0] = layers[0].cpu()
     model.model.embed_tokens = model.model.embed_tokens.cpu()
@@ -179,18 +216,18 @@ def llama_eval(model, testenc, dev):
         print(i)
         layer = layers[i].to(dev)
         
-        if args.nearest:
-            subset = find_layers(layer)
-            for name in subset:
-                quantizer = Quantizer()
-                quantizer.configure(
-                    args.wbits, perchannel=True, sym=False, mse=False
-                )
-                W = subset[name].weight.data
-                quantizer.find_params(W, weight=True)
-                subset[name].weight.data = quantize(
-                    W, quantizer.scale, quantizer.zero, quantizer.maxq
-                ).to(next(iter(layer.parameters())).dtype)
+        # if args.nearest:
+        #     subset = find_layers(layer)
+        #     for name in subset:
+        #         quantizer = Quantizer()
+        #         quantizer.configure(
+        #             args.wbits, perchannel=True, sym=False, mse=False
+        #         )
+        #         W = subset[name].weight.data
+        #         quantizer.find_params(W, weight=True)
+        #         subset[name].weight.data = quantize(
+        #             W, quantizer.scale, quantizer.zero, quantizer.maxq
+        #         ).to(next(iter(layer.parameters())).dtype)
 
         for j in range(nsamples):
             outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
@@ -248,7 +285,7 @@ if __name__ == '__main__':
         help='LlaMa model to load; pass location of hugginface converted checkpoint.'
     )
     parser.add_argument(
-        'dataset', type=str, choices=['wikitext2', 'ptb', 'c4'],
+        'dataset', type=str, choices=['wikitext2', 'ptb', 'c4', 'new-c4'],
         help='Where to extract calibration data from.'
     )
     parser.add_argument(
@@ -284,6 +321,10 @@ if __name__ == '__main__':
         help='Save quantized checkpoint under this name.'
     )
     parser.add_argument(
+        '--save_in_16bits', type=str, default='',
+        help='Save quantized checkpoint under this name in 16bits'
+    )
+    parser.add_argument(
         '--new-eval', action='store_true',
         help='Whether to use the new PTB and C4 eval.'
     )
@@ -299,6 +340,10 @@ if __name__ == '__main__':
         '--static-groups', action='store_true',
         help='Whether to use static groups; recommended when using `--actorder` for more efficient inference.'
     )
+    parser.add_argument(
+        '--wbits-yaml', type=str, default=None,
+        help='YAML file with the number of bits for each layer.'
+    )
 
     args = parser.parse_args()
 
@@ -309,7 +354,7 @@ if __name__ == '__main__':
         args.dataset, nsamples=args.nsamples, seed=args.seed, model=args.model, seqlen=model.seqlen
     )
 
-    if args.wbits < 16 and not args.nearest:
+    if args.wbits < 16:
         tick = time.time()
         quantizers = llama_sequential(model, dataloader, DEV)
         print(time.time() - tick)
@@ -328,3 +373,5 @@ if __name__ == '__main__':
         llama_pack3(model, quantizers)
         torch.save(model.state_dict(), args.save)
 
+    if args.save_in_16bits:
+        torch.save(model.state_dict(), args.save_in_16bits)
