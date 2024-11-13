@@ -24,6 +24,7 @@ class Quantizer(nn.Module):
         trits=False
     ):
         self.maxq = torch.tensor(2 ** bits - 1)
+        self.bits = bits
         self.perchannel = perchannel
         self.sym = sym
         self.mse = mse
@@ -34,6 +35,8 @@ class Quantizer(nn.Module):
             self.maxq = torch.tensor(-1) 
 
     def find_params(self, x, weight=False):
+        if self.bits == 16:
+            return
         dev = x.device
         self.maxq = self.maxq.to(dev)
 
@@ -117,7 +120,7 @@ class Quantizer(nn.Module):
             self.zero = self.zero.unsqueeze(0)
 
     def quantize(self, x):
-        if self.ready():
+        if self.ready() and not self.bits == 16:
             return quantize(x, self.scale, self.zero, self.maxq)
         return x
 

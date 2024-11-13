@@ -135,7 +135,7 @@ def llama_sequential(model, dataloader, dev):
                     h.remove()
 
                 for name in subset:
-                    print(i, name)
+                    print(i, name, f"bits = {gptq[name].quantizer.bits}")
                     print('Quantizing ...')
                     gptq[name].fasterquant(
                         percdamp=args.percdamp, groupsize=args.groupsize, actorder=args.act_order, static_groups=args.static_groups
